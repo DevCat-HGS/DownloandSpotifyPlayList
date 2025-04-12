@@ -101,16 +101,84 @@ class DownloadThread(QThread):
                 
                 # Descargar audio usando pytube
                 try:
-                    self.status_update.emit(f"Descargando: {song_name} - {artist}")
-                    yt = YouTube(youtube_url)
-                    audio_stream = yt.streams.filter(only_audio=True).first()
+                    self.status_update.emit(f"Buscando y descargando: {song_name} - {artist}")
                     
-                    # Nombre del archivo
-                    file_name = f"{song_name} - {artist}".replace('/', '_').replace('\\', '_')
-                    file_path = os.path.join(download_dir, f"{file_name}.mp3")
+                    # Configurar YouTube con opciones para evitar errores comunes
+                    yt = YouTube(
+                        youtube_url,
+                        use_oauth=False,
+                        allow_oauth_cache=False,
+                        on_progress_callback=lambda stream, chunk, bytes_remaining: self.status_update.emit(
+                            f"Descargando {song_name} - {artist}: {int((1 - bytes_remaining / stream.filesize) * 100)}%"
+                        )
+                    )
+                    
+                    # Verificar que se obtuvo correctamente el objeto YouTube
+                    if not yt:
+                        self.status_update.emit(f"Error: No se pudo obtener información del video para {song_name}")
+                        self.progress_update.emit(i + 1, total_tracks)
+                        continue
+                    
+                    # Obtener el stream de audio con la mejor calidad
+                    audio_stream = yt.streams.filter(only_audio=True).order_by('abr').desc().first()
+                    
+                    # Verificar que se obtuvo un stream de audio
+                    if not audio_stream:
+                        self.status_update.emit(f"Error: No se encontró stream de audio para {song_name}")
+                        self.progress_update.emit(i + 1, total_tracks)
+                        continue
+                    
+                    # Limpiar el nombre del archivo para evitar caracteres problemáticos
+                    file_name = f"{song_name} - {artist}"
+                    for char in ['/', '\\', '"', '?', ':', '*', '<', '>', '|']:
+                        file_name = file_name.replace(char, '_')
                     
                     # Descargar el archivo
-                    audio_stream.download(output_path=download_dir, filename=f"{file_name}.mp3")
+                    self.status_update.emit(f"Descargando: {song_name} - {artist}")
+                    
+                    # Intentar descargar con manejo de errores mejorado
+                    try:
+                        # Crear un nombre de archivo único para evitar conflictos
+                        safe_filename = f"{file_name}_{i}"
+                        mp3_file_path = os.path.join(download_dir, f"{safe_filename}.mp3")
+                        
+                        # Si ya existe un archivo con ese nombre, eliminarlo
+                        if os.path.exists(mp3_file_path):
+                            os.remove(mp3_file_path)
+                            
+                        # Descargar el archivo directamente como MP3
+                        self.status_update.emit(f"Descargando archivo: {file_name}")
+                        
+                        # Primero descargamos a un archivo temporal
+                        temp_file = audio_stream.download(
+                            output_path=download_dir,
+                            filename=safe_filename
+                        )
+                        
+                        # Verificar que el archivo se descargó correctamente
+                        if not os.path.exists(temp_file) or os.path.getsize(temp_file) == 0:
+                            raise Exception("El archivo descargado está vacío o no existe")
+                        
+                        self.status_update.emit(f"Archivo descargado como: {temp_file}")
+                        
+                        # Renombrar el archivo a .mp3 si no tiene ya la extensión
+                        if not temp_file.endswith('.mp3'):
+                            if os.path.exists(mp3_file_path):
+                                os.remove(mp3_file_path)
+                            
+                            self.status_update.emit(f"Renombrando a: {mp3_file_path}")
+                            os.rename(temp_file, mp3_file_path)
+                            temp_file = mp3_file_path
+                        
+                        # Verificar que el archivo final existe
+                        if os.path.exists(mp3_file_path) and os.path.getsize(mp3_file_path) > 0:
+                            self.status_update.emit(f"✅ Descargado: {song_name} - {artist}")
+                        else:
+                            raise Exception("Error al guardar el archivo descargado")
+                            
+                    except Exception as e:
+                        self.status_update.emit(f"❌ Error al descargar {song_name}: {str(e)}")
+                        # Continuar con la siguiente canción pero actualizar el progreso
                     
                     self.progress_update.emit(i + 1, total_tracks)
                 except Exception as e:
