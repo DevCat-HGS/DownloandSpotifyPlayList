@@ -3,13 +3,11 @@ import sys
 import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-                             QProgressBar, QMessageBox, QFileDialog)
+                             QProgressBar, QMessageBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtGui import QFont
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
-import requests
-import json
 from dotenv import load_dotenv
 from tqdm import tqdm
 from ytmusicapi import YTMusic
@@ -57,8 +55,17 @@ class DownloadThread(QThread):
             playlist_name = playlist['name']
             
             # Crear carpeta para la playlist
-            download_dir = os.path.join(os.path.expanduser("~"), "Downloads", "SpotifyPlaylists", playlist_name)
+            download_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SpotifyPlaylists", playlist_name)
             os.makedirs(download_dir, exist_ok=True)
+            self.status_update.emit(f"Directorio de descarga: {download_dir}")
+            
+            # Verificar que el directorio se creó correctamente
+            if not os.path.exists(download_dir):
+                raise Exception(f"No se pudo crear el directorio de descarga: {download_dir}")
+            
+            # Verificar permisos de escritura
+            if not os.access(download_dir, os.W_OK):
+                raise Exception(f"No hay permisos de escritura en el directorio: {download_dir}")
             
             # Obtener todas las canciones de la playlist
             tracks = []
@@ -107,11 +114,19 @@ class DownloadThread(QThread):
                     yt = YouTube(
                         youtube_url,
                         use_oauth=False,
-                        allow_oauth_cache=False,
-                        on_progress_callback=lambda stream, chunk, bytes_remaining: self.status_update.emit(
-                            f"Descargando {song_name} - {artist}: {int((1 - bytes_remaining / stream.filesize) * 100)}%"
-                        )
+                        allow_oauth_cache=False
                     )
+                    
+                    # Configurar el callback de progreso para actualizar tanto el estado como la barra de progreso
+                    def progress_callback(stream, chunk, bytes_remaining):
+                        file_progress = int((1 - bytes_remaining / stream.filesize) * 100)
+                        self.status_update.emit(f"Descargando {song_name} - {artist}: {file_progress}%")
+                        # Actualizar la barra de progreso general considerando el progreso actual de la canción
+                        total_progress = ((i * 100) + file_progress) / total_tracks
+                        self.progress_update.emit(int(total_progress), 100)
+                        QApplication.processEvents()
+                    
+                    yt.register_on_progress_callback(progress_callback)
                     
                     # Verificar que se obtuvo correctamente el objeto YouTube
                     if not yt:
@@ -139,48 +154,133 @@ class DownloadThread(QThread):
                     # Intentar descargar con manejo de errores mejorado
                     try:
                         # Crear un nombre de archivo único para evitar conflictos
-                        safe_filename = f"{file_name}_{i}"
+                        safe_filename = f"{file_name}"
+                        # Ya no necesitamos un archivo temporal, descargamos directamente como .mp3
                         mp3_file_path = os.path.join(download_dir, f"{safe_filename}.mp3")
                         
-                        # Si ya existe un archivo con ese nombre, eliminarlo
+                        # Asegurar que el directorio existe y tiene permisos de escritura
+                        if not os.path.exists(download_dir):
+                            os.makedirs(download_dir, exist_ok=True)
+                            self.status_update.emit(f"Creado directorio: {download_dir}")
+                        
+                        # Verificar permisos de escritura antes de intentar descargar
+                        if not os.access(download_dir, os.W_OK):
+                            self.status_update.emit(f"⚠️ Advertencia: No hay permisos de escritura en: {download_dir}")
+                            # Intentar corregir permisos
+                            try:
+                                os.chmod(download_dir, 0o755)
+                                self.status_update.emit(f"Permisos corregidos para: {download_dir}")
+                            except Exception as e:
+                                self.status_update.emit(f"No se pudieron corregir permisos: {str(e)}")
+                        
+                        # Limpiar archivos existentes
                         if os.path.exists(mp3_file_path):
-                            os.remove(mp3_file_path)
-                            
+                            try:
+                                os.remove(mp3_file_path)
+                                self.status_update.emit(f"Eliminado archivo existente: {mp3_file_path}")
+                            except Exception as e:
+                                self.status_update.emit(f"Error al limpiar archivo existente: {str(e)}")
+                        
                         # Descargar el archivo directamente como MP3
                         self.status_update.emit(f"Descargando archivo: {file_name}")
                         
-                        # Primero descargamos a un archivo temporal
-                        temp_file = audio_stream.download(
-                            output_path=download_dir,
-                            filename=safe_filename
-                        )
+                        # Intentar la descarga con reintentos
+                        max_retries = 3
+                        retry_count = 0
+                        download_success = False
                         
-                        # Verificar que el archivo se descargó correctamente
-                        if not os.path.exists(temp_file) or os.path.getsize(temp_file) == 0:
-                            raise Exception("El archivo descargado está vacío o no existe")
+                        while retry_count < max_retries and not download_success:
+                            try:
+                                temp_file = audio_stream.download(
+                                    output_path=download_dir,
+                                    filename=f"{safe_filename}.mp3",
+                                    skip_existing=False,
+                                    timeout=30  # Agregar timeout
+                                )
+                                
+                                # Verificar permisos de escritura en el directorio
+                                if not os.access(download_dir, os.W_OK):
+                                    raise Exception(f"No hay permisos de escritura en el directorio: {download_dir}")
+                                
+                                # Verificar que el archivo temporal existe y tiene el tamaño correcto
+                                if not os.path.exists(temp_file):
+                                    raise Exception(f"El archivo temporal no se creó: {temp_file}")
+                                
+                                file_size = os.path.getsize(temp_file)
+                                if file_size < 1024:  # Menos de 1KB probablemente es un error
+                                    raise Exception(f"El archivo descargado es demasiado pequeño: {file_size} bytes")
+                                
+                                # Forzar sincronización con el sistema de archivos para asegurar que el archivo se escriba completamente
+                                if hasattr(os, 'fsync'):
+                                    try:
+                                        with open(temp_file, 'rb') as f:
+                                            os.fsync(f.fileno())
+                                    except Exception as e:
+                                        self.status_update.emit(f"No se pudo sincronizar el archivo: {str(e)}")
+                                
+                                self.status_update.emit(f"Archivo temporal creado: {temp_file} ({file_size} bytes)")
+
+                                
+                                # Verificar que el archivo se descargó correctamente
+                                if os.path.exists(temp_file) and os.path.getsize(temp_file) > 0:
+                                    file_size = os.path.getsize(temp_file)
+                                    if file_size > 1024:  # Más de 1KB
+                                        download_success = True
+                                        self.status_update.emit(f"✅ Archivo MP3 descargado como: {temp_file} ({file_size} bytes)")
+                                        # Asegurar que la barra de progreso muestre el 100% para esta canción
+                                        total_progress = ((i + 1) * 100) / total_tracks
+                                        self.progress_update.emit(int(total_progress), 100)
+                                        QApplication.processEvents()
+                                        
+                                        # Verificar que el archivo existe en el directorio
+                                        if os.path.exists(temp_file):
+                                            self.status_update.emit(f"✓ Verificado: Archivo guardado correctamente en {download_dir}")
+                                        else:
+                                            raise Exception(f"Error: No se puede encontrar el archivo en {download_dir}")
+                                    else:
+                                        raise Exception(f"El archivo descargado es demasiado pequeño: {file_size} bytes")
+                                else:
+                                    raise Exception("El archivo descargado está vacío o no existe")
+                                    
+                            except Exception as e:
+                                retry_count += 1
+                                if retry_count < max_retries:
+                                    self.status_update.emit(f"Reintento {retry_count} de {max_retries}: {str(e)}")
+                                else:
+                                    raise Exception(f"Error después de {max_retries} intentos: {str(e)}")
                         
-                        self.status_update.emit(f"Archivo descargado como: {temp_file}")
-                        
-                        # Renombrar el archivo a .mp3 si no tiene ya la extensión
-                        if not temp_file.endswith('.mp3'):
-                            if os.path.exists(mp3_file_path):
-                                os.remove(mp3_file_path)
+                        # Verificar el archivo descargado
+                        try:
+                            # Como ahora descargamos directamente con extensión .mp3, no necesitamos renombrar
+                            # Verificamos que el archivo existe y tiene el tamaño correcto
+                            if not os.path.exists(temp_file):
+                                raise Exception(f"El archivo MP3 no existe: {temp_file}")
                             
-                            self.status_update.emit(f"Renombrando a: {mp3_file_path}")
-                            os.rename(temp_file, mp3_file_path)
-                            temp_file = mp3_file_path
-                        
-                        # Verificar que el archivo final existe
-                        if os.path.exists(mp3_file_path) and os.path.getsize(mp3_file_path) > 0:
-                            self.status_update.emit(f"✅ Descargado: {song_name} - {artist}")
-                        else:
-                            raise Exception("Error al guardar el archivo descargado")
+                            mp3_size = os.path.getsize(temp_file)
+                            if mp3_size < 1024:  # Menos de 1KB probablemente es un error
+                                raise Exception(f"El archivo MP3 es demasiado pequeño: {mp3_size} bytes")
+                            
+                            # Forzar sincronización con el sistema de archivos
+                            os.sync() if hasattr(os, 'sync') else None
+                            
+                            # Mostrar la ruta completa para ayudar al usuario a encontrar el archivo
+                            self.status_update.emit(f"✅ Descargado: {song_name} - {artist} ({mp3_size} bytes) en {download_dir}")
+                            
+                            # Verificar que el archivo realmente existe en el directorio
+                            files_in_dir = os.listdir(download_dir)
+                            if f"{safe_filename}.mp3" in files_in_dir:
+                                self.status_update.emit(f"✓ Verificado: Archivo {safe_filename}.mp3 encontrado en el directorio")
+                            else:
+                                self.status_update.emit(f"⚠️ Advertencia: Archivo {safe_filename}.mp3 no encontrado en el directorio a pesar de descarga exitosa")
+                                
+                        except Exception as e:
+                            raise Exception(f"Error al verificar el archivo: {str(e)}")
+
                             
                     except Exception as e:
                         self.status_update.emit(f"❌ Error al descargar {song_name}: {str(e)}")
                         # Continuar con la siguiente canción pero actualizar el progreso
-                    
-                    self.progress_update.emit(i + 1, total_tracks)
+                        self.progress_update.emit(i + 1, total_tracks)
                 except Exception as e:
                     self.status_update.emit(f"Error al descargar {song_name}: {str(e)}")
             
@@ -295,9 +395,10 @@ class SpotifyDownloaderApp(QMainWindow):
         
         # Iniciar hilo de descarga
         self.download_thread = DownloadThread(playlist_url)
-        self.download_thread.progress_update.connect(self.update_progress)
-        self.download_thread.status_update.connect(self.update_status)
-        self.download_thread.download_complete.connect(self.download_finished)
+        # Conectar señales usando Qt.QueuedConnection para asegurar la actualización correcta
+        self.download_thread.progress_update.connect(self.update_progress, Qt.QueuedConnection)
+        self.download_thread.status_update.connect(self.update_status, Qt.QueuedConnection)
+        self.download_thread.download_complete.connect(self.download_finished, Qt.QueuedConnection)
         self.download_thread.start()
     
     def cancel_download(self):
@@ -306,8 +407,12 @@ class SpotifyDownloaderApp(QMainWindow):
             self.status_label.setText('Cancelando descarga...')
     
     def update_progress(self, current, total):
-        progress = int((current / total) * 100)
-        self.progress_bar.setValue(progress)
+        try:
+            progress = int((current / total) * 100)
+            if 0 <= progress <= 100:  # Asegurar que el progreso esté en el rango válido
+                self.progress_bar.setValue(progress)
+        except Exception as e:
+            print(f"Error al actualizar progreso: {e}")
     
     def update_status(self, message):
         self.status_label.setText(message)
